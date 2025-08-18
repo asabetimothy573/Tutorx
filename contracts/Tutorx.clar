@@ -16,11 +16,18 @@
 (define-constant ERR_INVALID_CATEGORY (err u114))
 (define-constant ERR_SUBJECT_ALREADY_EXISTS (err u115))
 (define-constant ERR_CIRCULAR_DEPENDENCY (err u116))
+(define-constant ERR_PACKAGE_NOT_FOUND (err u117))
+(define-constant ERR_PACKAGE_INACTIVE (err u118))
+(define-constant ERR_PACKAGE_FULL (err u119))
+(define-constant ERR_INSUFFICIENT_SESSIONS (err u120))
+(define-constant ERR_PACKAGE_EXPIRED (err u121))
+(define-constant ERR_INVALID_DISCOUNT (err u122))
 
 (define-data-var next-tutor-id uint u1)
 (define-data-var next-session-id uint u1)
 (define-data-var platform-fee-percentage uint u5)
 (define-data-var next-subject-id uint u1)
+(define-data-var next-package-id uint u1)
 
 (define-map tutors
   { tutor-id: uint }
@@ -140,6 +147,66 @@
     progress-percentage: uint,
     started-at: uint,
     estimated-completion: uint
+  }
+)
+
+(define-map course-packages
+  { package-id: uint }
+  {
+    tutor-id: uint,
+    package-name: (string-ascii 50),
+    description: (string-ascii 200),
+    session-count: uint,
+    duration-per-session: uint,
+    regular-price: uint,
+    package-price: uint,
+    discount-percentage: uint,
+    max-enrollments: uint,
+    current-enrollments: uint,
+    subject-id: (optional uint),
+    difficulty-level: uint,
+    duration-weeks: uint,
+    created-at: uint,
+    expires-at: (optional uint),
+    active: bool
+  }
+)
+
+(define-map package-enrollments
+  { student: principal, package-id: uint }
+  {
+    enrolled-at: uint,
+    sessions-used: uint,
+    sessions-remaining: uint,
+    amount-paid: uint,
+    platform-fee-paid: uint,
+    last-session-at: (optional uint),
+    completion-percentage: uint,
+    package-rating: (optional uint),
+    active: bool
+  }
+)
+
+(define-map package-sessions
+  { package-id: uint, student: principal, session-number: uint }
+  {
+    session-id: (optional uint),
+    scheduled-at: (optional uint),
+    completed-at: (optional uint),
+    status: (string-ascii 20),
+    rating: (optional uint)
+  }
+)
+
+(define-map tutor-package-stats
+  { tutor-id: uint }
+  {
+    total-packages: uint,
+    active-packages: uint,
+    total-enrollments: uint,
+    completed-packages: uint,
+    total-package-revenue: uint,
+    average-package-rating: uint
   }
 )
 
@@ -733,3 +800,343 @@
     )
   )
 )
+
+(define-public (create-course-package (package-name (string-ascii 50)) (description (string-ascii 200)) (session-count uint) (duration-per-session uint) (regular-price uint) (discount-percentage uint) (max-enrollments uint) (subject-id (optional uint)) (difficulty-level uint) (duration-weeks uint) (expires-at (optional uint)))
+  (let
+    (
+      (package-id (var-get next-package-id))
+      (tutor-data (unwrap! (map-get? tutor-addresses { address: tx-sender }) ERR_TUTOR_NOT_FOUND))
+      (tutor (unwrap! (map-get? tutors { tutor-id: (get tutor-id tutor-data) }) ERR_TUTOR_NOT_FOUND))
+      (package-price (/ (* regular-price (- u100 discount-percentage)) u100))
+    )
+    (asserts! (get verified tutor) ERR_TUTOR_NOT_VERIFIED)
+    (asserts! (get active tutor) ERR_NOT_AUTHORIZED)
+    (asserts! (> session-count u0) ERR_INVALID_DIFFICULTY)
+    (asserts! (> duration-per-session u0) ERR_INVALID_DIFFICULTY)
+    (asserts! (and (>= discount-percentage u0) (<= discount-percentage u50)) ERR_INVALID_DISCOUNT)
+    (asserts! (and (>= difficulty-level u1) (<= difficulty-level u5)) ERR_INVALID_DIFFICULTY)
+    (asserts! (> max-enrollments u0) ERR_INVALID_DIFFICULTY)
+    (match subject-id
+      sub-id (asserts! (is-some (map-get? subjects { subject-id: sub-id })) ERR_SUBJECT_NOT_FOUND)
+      true
+    )
+    (map-set course-packages
+      { package-id: package-id }
+      {
+        tutor-id: (get tutor-id tutor-data),
+        package-name: package-name,
+        description: description,
+        session-count: session-count,
+        duration-per-session: duration-per-session,
+        regular-price: regular-price,
+        package-price: package-price,
+        discount-percentage: discount-percentage,
+        max-enrollments: max-enrollments,
+        current-enrollments: u0,
+        subject-id: subject-id,
+        difficulty-level: difficulty-level,
+        duration-weeks: duration-weeks,
+        created-at: stacks-block-height,
+        expires-at: expires-at,
+        active: true
+      }
+    )
+    (match (map-get? tutor-package-stats { tutor-id: (get tutor-id tutor-data) })
+      existing-stats (map-set tutor-package-stats
+        { tutor-id: (get tutor-id tutor-data) }
+        (merge existing-stats {
+          total-packages: (+ (get total-packages existing-stats) u1),
+          active-packages: (+ (get active-packages existing-stats) u1)
+        })
+      )
+      (map-set tutor-package-stats
+        { tutor-id: (get tutor-id tutor-data) }
+        {
+          total-packages: u1,
+          active-packages: u1,
+          total-enrollments: u0,
+          completed-packages: u0,
+          total-package-revenue: u0,
+          average-package-rating: u0
+        }
+      )
+    )
+    (var-set next-package-id (+ package-id u1))
+    (ok package-id)
+  )
+)
+
+(define-public (enroll-in-package (package-id uint))
+  (let
+    (
+      (package (unwrap! (map-get? course-packages { package-id: package-id }) ERR_PACKAGE_NOT_FOUND))
+      (existing-enrollment (map-get? package-enrollments { student: tx-sender, package-id: package-id }))
+      (platform-fee (/ (* (get package-price package) (var-get platform-fee-percentage)) u100))
+    )
+    (asserts! (get active package) ERR_PACKAGE_INACTIVE)
+    (asserts! (is-none existing-enrollment) ERR_ALREADY_RATED)
+    (asserts! (< (get current-enrollments package) (get max-enrollments package)) ERR_PACKAGE_FULL)
+    (match (get expires-at package)
+      expiry (asserts! (< stacks-block-height expiry) ERR_PACKAGE_EXPIRED)
+      true
+    )
+    (try! (stx-transfer? (get package-price package) tx-sender (as-contract tx-sender)))
+    (map-set package-enrollments
+      { student: tx-sender, package-id: package-id }
+      {
+        enrolled-at: stacks-block-height,
+        sessions-used: u0,
+        sessions-remaining: (get session-count package),
+        amount-paid: (get package-price package),
+        platform-fee-paid: platform-fee,
+        last-session-at: none,
+        completion-percentage: u0,
+        package-rating: none,
+        active: true
+      }
+    )
+    (map-set course-packages
+      { package-id: package-id }
+      (merge package { current-enrollments: (+ (get current-enrollments package) u1) })
+    )
+    (let
+      (
+        (tutor-stats (unwrap! (map-get? tutor-package-stats { tutor-id: (get tutor-id package) }) ERR_TUTOR_NOT_FOUND))
+      )
+      (map-set tutor-package-stats
+        { tutor-id: (get tutor-id package) }
+        (merge tutor-stats { total-enrollments: (+ (get total-enrollments tutor-stats) u1) })
+      )
+    )
+    (ok true)
+  )
+)
+
+(define-public (use-package-session (package-id uint) (session-number uint))
+  (let
+    (
+      (package (unwrap! (map-get? course-packages { package-id: package-id }) ERR_PACKAGE_NOT_FOUND))
+      (enrollment (unwrap! (map-get? package-enrollments { student: tx-sender, package-id: package-id }) ERR_PACKAGE_NOT_FOUND))
+      (tutor (unwrap! (map-get? tutors { tutor-id: (get tutor-id package) }) ERR_TUTOR_NOT_FOUND))
+    )
+    (asserts! (get active enrollment) ERR_PACKAGE_INACTIVE)
+    (asserts! (> (get sessions-remaining enrollment) u0) ERR_INSUFFICIENT_SESSIONS)
+    (asserts! (<= session-number (get session-count package)) ERR_INVALID_DIFFICULTY)
+    (map-set package-sessions
+      { package-id: package-id, student: tx-sender, session-number: session-number }
+      {
+        session-id: none,
+        scheduled-at: (some stacks-block-height),
+        completed-at: none,
+        status: "scheduled",
+        rating: none
+      }
+    )
+    (map-set package-enrollments
+      { student: tx-sender, package-id: package-id }
+      (merge enrollment {
+        sessions-used: (+ (get sessions-used enrollment) u1),
+        sessions-remaining: (- (get sessions-remaining enrollment) u1),
+        last-session-at: (some stacks-block-height)
+      })
+    )
+    (ok true)
+  )
+)
+
+(define-public (complete-package-session (package-id uint) (session-number uint))
+  (let
+    (
+      (package (unwrap! (map-get? course-packages { package-id: package-id }) ERR_PACKAGE_NOT_FOUND))
+      (enrollment (unwrap! (map-get? package-enrollments { student: tx-sender, package-id: package-id }) ERR_PACKAGE_NOT_FOUND))
+      (session (unwrap! (map-get? package-sessions { package-id: package-id, student: tx-sender, session-number: session-number }) ERR_SESSION_NOT_FOUND))
+      (tutor (unwrap! (map-get? tutors { tutor-id: (get tutor-id package) }) ERR_TUTOR_NOT_FOUND))
+    )
+    (asserts! (or (is-eq tx-sender (get address tutor)) (get active enrollment)) ERR_NOT_AUTHORIZED)
+    (asserts! (is-eq (get status session) "scheduled") ERR_SESSION_ALREADY_COMPLETED)
+    (map-set package-sessions
+      { package-id: package-id, student: tx-sender, session-number: session-number }
+      (merge session {
+        completed-at: (some stacks-block-height),
+        status: "completed"
+      })
+    )
+    (let
+      (
+        (new-completion (/ (* (get sessions-used enrollment) u100) (get session-count package)))
+      )
+      (map-set package-enrollments
+        { student: tx-sender, package-id: package-id }
+        (merge enrollment { completion-percentage: new-completion })
+      )
+    )
+    (ok true)
+  )
+)
+
+(define-public (pay-package-tutor (package-id uint))
+  (let
+    (
+      (package (unwrap! (map-get? course-packages { package-id: package-id }) ERR_PACKAGE_NOT_FOUND))
+      (enrollment (unwrap! (map-get? package-enrollments { student: tx-sender, package-id: package-id }) ERR_PACKAGE_NOT_FOUND))
+      (tutor (unwrap! (map-get? tutors { tutor-id: (get tutor-id package) }) ERR_TUTOR_NOT_FOUND))
+      (tutor-payment (- (get amount-paid enrollment) (get platform-fee-paid enrollment)))
+    )
+    (asserts! (>= (get completion-percentage enrollment) u100) ERR_SESSION_NOT_COMPLETED)
+    (try! (as-contract (stx-transfer? tutor-payment tx-sender (get address tutor))))
+    (let
+      (
+        (tutor-stats (unwrap! (map-get? tutor-package-stats { tutor-id: (get tutor-id package) }) ERR_TUTOR_NOT_FOUND))
+      )
+      (map-set tutor-package-stats
+        { tutor-id: (get tutor-id package) }
+        (merge tutor-stats {
+          completed-packages: (+ (get completed-packages tutor-stats) u1),
+          total-package-revenue: (+ (get total-package-revenue tutor-stats) tutor-payment)
+        })
+      )
+    )
+    (ok true)
+  )
+)
+
+(define-public (rate-package (package-id uint) (rating uint))
+  (let
+    (
+      (package (unwrap! (map-get? course-packages { package-id: package-id }) ERR_PACKAGE_NOT_FOUND))
+      (enrollment (unwrap! (map-get? package-enrollments { student: tx-sender, package-id: package-id }) ERR_PACKAGE_NOT_FOUND))
+    )
+    (asserts! (and (>= rating u1) (<= rating u5)) ERR_INVALID_RATING)
+    (asserts! (>= (get completion-percentage enrollment) u80) ERR_SESSION_NOT_COMPLETED)
+    (asserts! (is-none (get package-rating enrollment)) ERR_ALREADY_RATED)
+    (map-set package-enrollments
+      { student: tx-sender, package-id: package-id }
+      (merge enrollment { package-rating: (some rating) })
+    )
+    (let
+      (
+        (tutor-stats (unwrap! (map-get? tutor-package-stats { tutor-id: (get tutor-id package) }) ERR_TUTOR_NOT_FOUND))
+        (current-rating (get average-package-rating tutor-stats))
+        (total-ratings (get completed-packages tutor-stats))
+        (new-average (if (is-eq total-ratings u0)
+          rating
+          (/ (+ (* current-rating total-ratings) rating) (+ total-ratings u1))
+        ))
+      )
+      (map-set tutor-package-stats
+        { tutor-id: (get tutor-id package) }
+        (merge tutor-stats { average-package-rating: new-average })
+      )
+    )
+    (ok true)
+  )
+)
+
+(define-public (deactivate-package (package-id uint))
+  (let
+    (
+      (package (unwrap! (map-get? course-packages { package-id: package-id }) ERR_PACKAGE_NOT_FOUND))
+      (tutor-data (unwrap! (map-get? tutor-addresses { address: tx-sender }) ERR_TUTOR_NOT_FOUND))
+    )
+    (asserts! (is-eq (get tutor-id package) (get tutor-id tutor-data)) ERR_NOT_AUTHORIZED)
+    (map-set course-packages
+      { package-id: package-id }
+      (merge package { active: false })
+    )
+    (let
+      (
+        (tutor-stats (unwrap! (map-get? tutor-package-stats { tutor-id: (get tutor-id tutor-data) }) ERR_TUTOR_NOT_FOUND))
+      )
+      (map-set tutor-package-stats
+        { tutor-id: (get tutor-id tutor-data) }
+        (merge tutor-stats { active-packages: (- (get active-packages tutor-stats) u1) })
+      )
+    )
+    (ok true)
+  )
+)
+
+(define-public (refund-unused-sessions (package-id uint))
+  (let
+    (
+      (package (unwrap! (map-get? course-packages { package-id: package-id }) ERR_PACKAGE_NOT_FOUND))
+      (enrollment (unwrap! (map-get? package-enrollments { student: tx-sender, package-id: package-id }) ERR_PACKAGE_NOT_FOUND))
+      (refund-per-session (/ (get amount-paid enrollment) (get session-count package)))
+      (refund-amount (* refund-per-session (get sessions-remaining enrollment)))
+    )
+    (asserts! (> (get sessions-remaining enrollment) u0) ERR_INSUFFICIENT_SESSIONS)
+    (asserts! (get active enrollment) ERR_PACKAGE_INACTIVE)
+    (try! (as-contract (stx-transfer? refund-amount tx-sender tx-sender)))
+    (map-set package-enrollments
+      { student: tx-sender, package-id: package-id }
+      (merge enrollment {
+        sessions-remaining: u0,
+        active: false
+      })
+    )
+    (ok refund-amount)
+  )
+)
+
+(define-read-only (get-package (package-id uint))
+  (map-get? course-packages { package-id: package-id })
+)
+
+(define-read-only (get-package-enrollment (student principal) (package-id uint))
+  (map-get? package-enrollments { student: student, package-id: package-id })
+)
+
+(define-read-only (get-package-session (package-id uint) (student principal) (session-number uint))
+  (map-get? package-sessions { package-id: package-id, student: student, session-number: session-number })
+)
+
+(define-read-only (get-tutor-package-stats (tutor-id uint))
+  (map-get? tutor-package-stats { tutor-id: tutor-id })
+)
+
+(define-read-only (get-next-package-id)
+  (var-get next-package-id)
+)
+
+(define-read-only (calculate-package-savings (package-id uint))
+  (match (map-get? course-packages { package-id: package-id })
+    package (let
+      (
+        (total-regular (* (get regular-price package) (get session-count package)))
+        (savings (- total-regular (get package-price package)))
+      )
+      (ok {
+        regular-total: total-regular,
+        package-price: (get package-price package),
+        total-savings: savings,
+        savings-percentage: (get discount-percentage package)
+      })
+    )
+    ERR_PACKAGE_NOT_FOUND
+  )
+)
+
+(define-read-only (check-package-eligibility (student principal) (package-id uint))
+  (match (map-get? course-packages { package-id: package-id })
+    package (let
+      (
+        (existing-enrollment (map-get? package-enrollments { student: student, package-id: package-id }))
+        (is-full (>= (get current-enrollments package) (get max-enrollments package)))
+        (is-expired (match (get expires-at package)
+          expiry (>= stacks-block-height expiry)
+          false
+        ))
+      )
+      (and 
+        (get active package)
+        (is-none existing-enrollment)
+        (not is-full)
+        (not is-expired)
+      )
+    )
+    false
+  )
+)
+
+
+
